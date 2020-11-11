@@ -7,7 +7,7 @@ import requests
 import json
 import RPi.GPIO as GPIO
 from random import randrange
-from threading import Thread 
+from threading import Thread
 import threading
 from dateutil import parser
 from datetime import datetime
@@ -44,38 +44,60 @@ OFF_DATA = {
     ]
 }
 
+COORDINATES = {
+    "Melbourne": {"lat":-37.799305,"lng":145.164842},
+    "Sydney": {"lat":-33.8688,"lng":151.2093}
+}
+
 class Logic:
-    def __init__(self): 
-        self._running = True
+    def __init__(self):
+        global flag
         print("Init....")
-        GPIO.setmode(GPIO.BOARD) # Here I use Pin 7 connect to OUTPUT of the sensor.
+        # Here I use Pin 7 connect to OUTPUT of the sensor.
+        GPIO.setmode(GPIO.BOARD)
         GPIO.setwarnings(False)
         GPIO.setup(12, GPIO.IN)
-        #self.off()
-        #time.sleep(0.5)
+        self._running = True
+        self._mode = 1
         self.setBrightness(1,)
-      
-    def terminate(self): 
+        flag = True
+
+    def terminate(self):
         self._running = False
 
-    def run(self,checkTimeEvent):
+    def changeMode(self, mode):
+        if self._mode == mode:
+            return
+        if mode == 1:
+            self.on()
+        elif mode == 2:
+            self.forceOff()
+        self._mode = mode
+
+    def run(self, checkTimeEvent):
         trigger = 0
         try:
             while self._running:
-                if (GPIO.input(12)):
-                    #print('detected')
+                if (GPIO.input(12)):  # detect
                     trigger = trigger + 1
                     if (trigger > 5):
-                        #print('movement detected')
-                        self.setBrightness(25,)
+                        if self._mode == 1:
+                            self.setBrightness(25,)
+                        if self._mode == 2:
+                            self.on()
                 elif (trigger >= 35):
                     print('delay 3s')
                     time.sleep(3)
-                    self.setBrightness(1,)
+                    if self._mode == 1:
+                        self.setBrightness(1,)
+                    if self._mode == 2:
+                        self.off()
                     trigger = 0
                 else:
-                    #print('off')
-                    self.setBrightness(1,)
+                    if self._mode == 1:
+                        self.setBrightness(1,)
+                    if self._mode == 2:
+                        self.off()
                     trigger = 0
                 time.sleep(0.1)
                 checkTimeEvent.wait()
@@ -83,8 +105,7 @@ class Logic:
             print("Interrupt received.")
         finally:
             GPIO.cleanup()
-            requests.put(
-                url=API_ENDPOINT, data=json.dumps(OFF_DATA), headers=headers) # focre off
+            self.forceOff()  # focre off
             print("User abort.")
         return
 
@@ -112,8 +133,16 @@ class Logic:
             flag = False
         return
 
+    def forceOff(self):
+        global flag
+        requests.put(
+            url=API_ENDPOINT, data=json.dumps(OFF_DATA), headers=headers)
+        flag = False
+        return
+
     def setBrightness(self, value):
         global currentBrightness
+        global flag
         if value == currentBrightness:
             return
         currentBrightness = value
@@ -128,7 +157,8 @@ class Logic:
             ]
         }
         requests.put(
-                url=API_ENDPOINT, data=json.dumps(brightness_DATA), headers=headers)
+            url=API_ENDPOINT, data=json.dumps(brightness_DATA), headers=headers)
+        flag = True
 
     def changeColor(self):
         colorCoder = randrange(12) * 30
@@ -150,50 +180,78 @@ class Logic:
         }
         return Color_DATA
 
-class Deamon:
-    def __init__(self): 
-        self._running = True
-        localtz = timezone('Australia/Melbourne')
-        self.onTime = parser.parse("18:00:00+10:00").astimezone(localtz).time()
-        self.offTime = parser.parse("2:00:00+10:00").astimezone(localtz).time()
-        self.currentTime = datetime.now(tz = localtz).time()
 
-    def terminate(self): 
+class Deamon:
+    def __init__(self):
+        self._running = True
+        self.setKeyTimes()
+        self.dailyReset = False
+        
+    def terminate(self):
         self._running = False
 
-    def run(self,checkTimeEvent):
-        logic = Logic()
-        logicThread = Thread(target = logic.run,args=(checkTimeEvent,)) 
-        logicThread.start() 
+    def setKeyTimes(self):
+        city = COORDINATES["Melbourne"]
+        URL = f"https://api.sunrise-sunset.org/json?lat={city['lat']}&lng={city['lng']}&formatted=0"
+        resp = requests.get(url = URL)
+        data = resp.json()['results']
 
-        print('deamon is running')
-        print(self.currentTime)
-        print(self.offTime)
-        print(self.onTime)
+        self.localtz = timezone('Australia/Melbourne')
+        self.onTime = parser.parse(
+            data["sunset"]).astimezone(self.localtz).time()
+        self.mode1Time = (parser.parse(
+            data["solar_noon"]).astimezone(self.localtz)- timedelta(hours=12)).time()  # 00:00
+        self.mode2Time = parser.parse(
+            data["sunrise"]).astimezone(self.localtz).time()
+        self.currentTime = datetime.now(tz=self.localtz).time()
+
+
+    def run(self, checkTimeEvent):
+        logic = Logic()
+        logicThread = Thread(target=logic.run, args=(checkTimeEvent,))
+        logicThread.start()
+
+        print(f'[{ self.currentTime}] init: deamon is running')
+        print(f'[{ self.currentTime}] init: midnight {self.mode1Time}')
+        print(f'[{ self.currentTime}] init: sunrise time {self.mode2Time}')
+        print(f'[{ self.currentTime}] init: sunset time {self.onTime}')
         try:
             while self._running:
-                if self.currentTime > self.offTime and self.currentTime < self.onTime:
+                self.currentTime = datetime.now(tz=self.localtz).time()
+                if self.currentTime > self.mode2Time and self.currentTime < self.onTime: # pause (day)
                     checkTimeEvent.clear()
-                    print('deamon: pausing logic')
-                if self.currentTime < self.offTime or self.currentTime > self.onTime:
+                    print(f'[{ self.currentTime}] deamon: pausing logic')
+                    requests.put(
+                        url=API_ENDPOINT, data=json.dumps(OFF_DATA), headers=headers)  # focre off
+                if self.currentTime > self.onTime: # night
+                    if self.dailyReset == True:
+                        self.dailyReset = False
+                    logic.changeMode(1)
                     checkTimeEvent.set()
-                    print('deamon: resuming logic')
-                time.sleep(36000)
+                    print(f'[{ self.currentTime}] deamon: now in mode 1 (brightness)')
+                if self.currentTime < self.mode2Time and self.currentTime > self.mode1Time: # dawn
+                    if self.dailyReset == False:
+                        setKeyTimes() # update the times
+                        self.dailyReset = True 
+                    logic.changeMode(2)
+                    checkTimeEvent.set()
+                    print(f'[{ self.currentTime}] deamon: now in mode 2 (on/off)')
+                time.sleep(600)
         except KeyboardInterrupt:
             print('stopping deamon')
             logic.terminate()
             checkTimeEvent.set()
-            # Wait for actual termination 
-            logicThread.join()  
+            # Wait for actual termination
+            logicThread.join()
+
 
 def main():
     checkTimeEvent = threading.Event()
     deamon = Deamon()
-    deamonThread = Thread(target = deamon.run,args=(checkTimeEvent,))
+    deamonThread = Thread(target=deamon.run, args=(checkTimeEvent,))
     deamonThread.run()
     return
 
 
 if __name__ == "__main__":
     main()
-
